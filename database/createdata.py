@@ -11,9 +11,12 @@ def init_db(db_path=None, drop_existing=False):
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
 
-    # Enforce foreign key constraints and WAL mode
+    # Enforce foreign key constraints and universal DELETE journal mode
     cursor.execute("PRAGMA foreign_keys = ON;")
-    cursor.execute("PRAGMA journal_mode = WAL;")
+    try:
+        cursor.execute("PRAGMA journal_mode = DELETE;")
+    except Exception:
+        pass
 
     # Check if existing Jobs table needs schema migration
     needs_recreate = drop_existing

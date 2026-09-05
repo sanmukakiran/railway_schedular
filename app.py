@@ -21,9 +21,16 @@ if not os.path.exists(DB_PATH):
 def get_connection():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = sqlite3.connect(DB_PATH, timeout=30)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA busy_timeout=30000;")
-    conn.execute("PRAGMA foreign_keys = ON;")
+    try:
+        conn.execute("PRAGMA busy_timeout=30000;")
+        conn.execute("PRAGMA foreign_keys = ON;")
+    except Exception:
+        pass
+    try:
+        # Use DELETE journal mode for compatibility with Streamlit Cloud container mounts (/mount/src)
+        conn.execute("PRAGMA journal_mode=DELETE;")
+    except Exception:
+        pass
     return conn
 
 # Import AI Engine & Data Generation
@@ -43,6 +50,30 @@ def reset_database():
     """Regenerates the complete authentic Indian Railways dataset."""
     generate_large_dataset(db_path=DB_PATH)
     run_scoring_engine(db_path=DB_PATH, score_all=True)
+
+def ensure_database_ready():
+    """Auto-initializes database if running fresh on Streamlit Cloud or container mounts."""
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='Jobs'")
+        has_jobs = cur.fetchone()
+        if not has_jobs:
+            conn.close()
+            reset_database()
+        else:
+            cur.execute("SELECT count(*) FROM Jobs")
+            cnt = cur.fetchone()[0]
+            conn.close()
+            if cnt == 0:
+                reset_database()
+    except Exception:
+        try:
+            reset_database()
+        except Exception:
+            pass
+
+ensure_database_ready()
 
 
 # ============================================================

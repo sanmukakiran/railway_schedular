@@ -1,0 +1,27 @@
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+
+# SQLite database
+# Ignore root database
+/railway_planning.db
+
+# Ignore SQLite temporary files
+*.db-wal
+*.db-shm
+
+# But keep the database inside database/
+!database/
+!database/railway_planning.db
+*.db-shm
+*.db-wal
+
+# VS Code
+.vscode/
+
+# Environment variables
+.env

@@ -1,4 +1,7 @@
 import os
+import sys
+import shutil
+import tempfile
 import sqlite3
 import uuid
 from datetime import datetime, date, timedelta
@@ -12,32 +15,57 @@ import streamlit as st
 # DATABASE & BACKEND INTEGRATION
 # ============================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, "database", "railway_planning.db")
-if not os.path.exists(DB_PATH):
+sys.path.insert(0, BASE_DIR)
+sys.path.insert(0, os.path.join(BASE_DIR, "database"))
+
+BUNDLED_DB = os.path.join(BASE_DIR, "database", "railway_planning.db")
+if not os.path.exists(BUNDLED_DB):
     alt_path = os.path.join(BASE_DIR, "railway_planning.db")
     if os.path.exists(alt_path):
-        DB_PATH = alt_path
+        BUNDLED_DB = alt_path
+
+# Streamlit Community Cloud mounts apps at /mount/src/... where SQLite locking
+# and rollback journals frequently fail with disk I/O errors.
+# If on /mount/src or directory is not writable, we run the database from /tmp.
+is_cloud = "/mount/src" in BASE_DIR or os.environ.get("STREAMLIT_SERVER_ENVIRONMENT") == "cloud"
+can_write_repo = False
+try:
+    test_file = os.path.join(os.path.dirname(BUNDLED_DB) if os.path.exists(BUNDLED_DB) else BASE_DIR, ".write_test")
+    with open(test_file, "w") as f:
+        f.write("ok")
+    os.remove(test_file)
+    can_write_repo = True
+except Exception:
+    can_write_repo = False
+
+if is_cloud or not can_write_repo:
+    DB_DIR = os.path.join(tempfile.gettempdir(), "railway_ai_data")
+    os.makedirs(DB_DIR, exist_ok=True)
+    DB_PATH = os.path.join(DB_DIR, "railway_planning.db")
+    if os.path.exists(BUNDLED_DB):
+        if not os.path.exists(DB_PATH) or (os.path.getsize(DB_PATH) < 50000 and os.path.getsize(BUNDLED_DB) > 50000):
+            try:
+                shutil.copy2(BUNDLED_DB, DB_PATH)
+            except Exception:
+                pass
+else:
+    DB_PATH = BUNDLED_DB
 
 def get_connection():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
     try:
         conn.execute("PRAGMA busy_timeout=30000;")
         conn.execute("PRAGMA foreign_keys = ON;")
     except Exception:
         pass
     try:
-        # Use DELETE journal mode for compatibility with Streamlit Cloud container mounts (/mount/src)
         conn.execute("PRAGMA journal_mode=DELETE;")
     except Exception:
         pass
     return conn
 
 # Import AI Engine & Data Generation
-import sys
-sys.path.insert(0, BASE_DIR)
-sys.path.insert(0, os.path.join(BASE_DIR, "database"))
-
 from ai_scorer import run_scoring_engine
 from ai_scheduler import run_scheduler
 from generatedata import generate_large_dataset
@@ -47,33 +75,57 @@ def run_scheduler_pipeline(horizon="All"):
     return run_scheduler(db_path=DB_PATH, horizon=horizon)
 
 def reset_database():
-    """Regenerates the complete authentic Indian Railways dataset."""
+    """Regenerates the complete authentic Indian Railways dataset and schedules blocks."""
     generate_large_dataset(db_path=DB_PATH)
     run_scoring_engine(db_path=DB_PATH, score_all=True)
+    run_scheduler(db_path=DB_PATH, horizon="All")
 
 def ensure_database_ready():
     """Auto-initializes database if running fresh on Streamlit Cloud or container mounts."""
+    needed_tables = ["Tracks", "Trains", "Jobs", "Corridor_Availability", "Block_Register", "Block_Jobs"]
+    must_reset = False
     try:
-        conn = get_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='Jobs'")
-        has_jobs = cur.fetchone()
-        if not has_jobs:
-            conn.close()
-            reset_database()
+        if not os.path.exists(DB_PATH) or os.path.getsize(DB_PATH) < 10000:
+            must_reset = True
         else:
-            cur.execute("SELECT count(*) FROM Jobs")
-            cnt = cur.fetchone()[0]
+            conn = get_connection()
+            cur = conn.cursor()
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            existing_tables = set(r[0] for r in cur.fetchall())
+            for tbl in needed_tables:
+                if tbl not in existing_tables:
+                    must_reset = True
+                    break
+            if not must_reset:
+                cur.execute("SELECT count(*) FROM Jobs")
+                cnt = cur.fetchone()[0]
+                cur.execute("SELECT count(*) FROM Block_Register")
+                b_cnt = cur.fetchone()[0]
+                if cnt == 0 or b_cnt == 0:
+                    must_reset = True
             conn.close()
-            if cnt == 0:
-                reset_database()
     except Exception:
+        must_reset = True
+
+    if must_reset:
         try:
             reset_database()
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"Error during auto-initialization: {e}")
 
 ensure_database_ready()
+
+def safe_read_sql(sql, conn, params=None, default_cols=None):
+    """Executes SQL query and returns a DataFrame, returning fallback empty DataFrame on error."""
+    try:
+        if params is not None:
+            return pd.read_sql_query(sql, conn, params=params)
+        return pd.read_sql_query(sql, conn)
+    except Exception as e:
+        print(f"safe_read_sql fallback for query: {e}")
+        if default_cols:
+            return pd.DataFrame(columns=default_cols)
+        return pd.DataFrame()
 
 
 # ============================================================
@@ -318,13 +370,14 @@ st.markdown(
 # ============================================================
 # CONNECTION + KPI DATA
 # ============================================================
-# CONNECTION + KPI DATA
-# ============================================================
 conn = get_connection()
 
 def count_query(sql):
     try:
-        return int(pd.read_sql_query(sql, conn)["c"].iloc[0])
+        res = safe_read_sql(sql, conn, default_cols=["c"])
+        if not res.empty and "c" in res.columns:
+            return int(res["c"].iloc[0])
+        return 0
     except Exception:
         return 0
 
@@ -334,16 +387,12 @@ scheduled_jobs = count_query("SELECT COUNT(*) AS c FROM Jobs WHERE status = 'Sch
 delayed_jobs = count_query("SELECT COUNT(*) AS c FROM Jobs WHERE status = 'Delayed'")
 total_blocks = count_query("SELECT COUNT(*) AS c FROM Block_Register")
 
-try:
-    total_downtime_saved_mins = int(pd.read_sql_query("SELECT COALESCE(SUM(corridor_downtime_saved_mins), 0) AS s FROM Block_Register", conn)["s"].iloc[0])
-except Exception:
-    total_downtime_saved_mins = 0
+res_dt = safe_read_sql("SELECT COALESCE(SUM(corridor_downtime_saved_mins), 0) AS s FROM Block_Register", conn, default_cols=["s"])
+total_downtime_saved_mins = int(res_dt["s"].iloc[0]) if not res_dt.empty and "s" in res_dt.columns and pd.notna(res_dt["s"].iloc[0]) else 0
 
-try:
-    total_maint_time = int(pd.read_sql_query("SELECT COALESCE(SUM(min_duration_needed), 1) AS s FROM Jobs WHERE status = 'Scheduled'", conn)["s"].iloc[0])
-    uptime_gain_pct = round((total_downtime_saved_mins / max(total_maint_time, 1)) * 100.0, 1)
-except Exception:
-    uptime_gain_pct = 0.0
+res_mt = safe_read_sql("SELECT COALESCE(SUM(min_duration_needed), 1) AS s FROM Jobs WHERE status = 'Scheduled'", conn, default_cols=["s"])
+total_maint_time = int(res_mt["s"].iloc[0]) if not res_mt.empty and "s" in res_mt.columns and pd.notna(res_mt["s"].iloc[0]) else 1
+uptime_gain_pct = round((total_downtime_saved_mins / max(total_maint_time, 1)) * 100.0, 1)
 
 
 # ============================================================
@@ -408,11 +457,11 @@ with st.sidebar:
     st.markdown("### + BDMS Maintenance Request")
 
     # Fetch track list for dropdown
-    try:
-        track_list = pd.read_sql_query("SELECT track_id, section_name FROM Tracks ORDER BY track_id", conn)
+    track_list = safe_read_sql("SELECT track_id, section_name FROM Tracks ORDER BY track_id", conn, default_cols=["track_id", "section_name"])
+    if not track_list.empty and "track_id" in track_list.columns:
         track_choices = [f"{r['track_id']} ({r['section_name'][:24]})" for _, r in track_list.iterrows()]
-    except Exception:
-        track_choices = ["TRK-101", "TRK-102", "TRK-103"]
+    else:
+        track_choices = ["TRK-101 (NDLS - CNB)", "TRK-102 (CNB - PRYJ)", "TRK-103 (PRYJ - DDU)"]
 
     with st.form("new_job_form", clear_on_submit=True):
         auto_id = f"JOB-{uuid.uuid4().hex[:6].upper()}"
@@ -493,7 +542,7 @@ with st.sidebar:
 # ============================================================
 # LOAD DATA USED BY MULTIPLE TABS
 # ============================================================
-blocks_df = pd.read_sql_query(
+blocks_df = safe_read_sql(
     """
     SELECT
         b.block_id AS 'Block ID',
@@ -514,9 +563,14 @@ blocks_df = pd.read_sql_query(
     ORDER BY b.window_start ASC
     """,
     conn,
+    default_cols=[
+        'Block ID', 'Track', 'Corridor Section', 'Window Start', 'Window End',
+        'Duration (m)', 'Depts Involved', 'Consolidated Departments', 'Tasks Bundled',
+        'Power Block', 'Downtime Saved (m)', 'Horizon', 'Status'
+    ]
 )
 
-jobs_df = pd.read_sql_query(
+jobs_df = safe_read_sql(
     """
     SELECT
         j.job_id AS 'Job ID',
@@ -541,9 +595,14 @@ jobs_df = pd.read_sql_query(
     ORDER BY j.ai_score DESC
     """,
     conn,
+    default_cols=[
+        'Job ID', 'Track', 'Section', 'Source', 'Department', 'Type', 'Task Details',
+        'Severity', 'Overdue (d)', 'PSR (km/h)', 'Duration (m)', 'Power Req',
+        'Horizon', 'Requested', 'Deadline', 'AI Score', 'Status'
+    ]
 )
 
-avail_df = pd.read_sql_query(
+avail_df = safe_read_sql(
     """
     SELECT
         a.availability_id AS 'Window ID',
@@ -559,9 +618,13 @@ avail_df = pd.read_sql_query(
     ORDER BY a.available_date ASC, a.window_start ASC
     """,
     conn,
+    default_cols=[
+        'Window ID', 'Track', 'Section', 'Date', 'Available From',
+        'Available Until', 'Duration (m)', 'Window Type'
+    ]
 )
 
-trains_df = pd.read_sql_query(
+trains_df = safe_read_sql(
     """
     SELECT
         tr.train_id AS 'Instance ID',
@@ -577,6 +640,10 @@ trains_df = pd.read_sql_query(
     ORDER BY tr.run_date ASC, tr.scheduled_arrival ASC
     """,
     conn,
+    default_cols=[
+        'Instance ID', 'Train No.', 'Train Name', 'Category', 'Track',
+        'Date', 'Arrival', 'Departure', 'Flexibility (m)'
+    ]
 )
 
 
@@ -700,27 +767,37 @@ with tab1:
         
         selected_block = st.selectbox("Select Block to inspect bundled tasks", block_options, key="select_block_details")
 
-        details_df = pd.read_sql_query(
-            """
-            SELECT
-                j.job_id AS 'Job ID',
-                j.source_system AS 'Source',
-                j.department AS 'Department',
-                j.maintenance_type AS 'Type',
-                j.task AS 'Task Details',
-                j.defect_severity AS 'Severity',
-                j.overdue_days AS 'Overdue (d)',
-                j.min_duration_needed AS 'Duration (m)',
-                CASE WHEN j.power_block_required = 1 THEN 'Yes' ELSE 'No' END AS 'OHE Power Off',
-                j.ai_score AS 'AI Priority'
-            FROM Block_Jobs bj
-            JOIN Jobs j ON bj.job_id = j.job_id
-            WHERE bj.block_id = ?
-            ORDER BY j.ai_score DESC
-            """,
-            conn,
-            params=(selected_block,),
-        )
+        if selected_block:
+            details_df = safe_read_sql(
+                """
+                SELECT
+                    j.job_id AS 'Job ID',
+                    j.source_system AS 'Source',
+                    j.department AS 'Department',
+                    j.maintenance_type AS 'Type',
+                    j.task AS 'Task Details',
+                    j.defect_severity AS 'Severity',
+                    j.overdue_days AS 'Overdue (d)',
+                    j.min_duration_needed AS 'Duration (m)',
+                    CASE WHEN j.power_block_required = 1 THEN 'Yes' ELSE 'No' END AS 'OHE Power Off',
+                    j.ai_score AS 'AI Priority'
+                FROM Block_Jobs bj
+                JOIN Jobs j ON bj.job_id = j.job_id
+                WHERE bj.block_id = ?
+                ORDER BY j.ai_score DESC
+                """,
+                conn,
+                params=(selected_block,),
+                default_cols=[
+                    'Job ID', 'Source', 'Department', 'Type', 'Task Details',
+                    'Severity', 'Overdue (d)', 'Duration (m)', 'OHE Power Off', 'AI Priority'
+                ]
+            )
+        else:
+            details_df = pd.DataFrame(columns=[
+                'Job ID', 'Source', 'Department', 'Type', 'Task Details',
+                'Severity', 'Overdue (d)', 'Duration (m)', 'OHE Power Off', 'AI Priority'
+            ])
 
         render_vintage_table(details_df, progress_column="AI Priority")
 

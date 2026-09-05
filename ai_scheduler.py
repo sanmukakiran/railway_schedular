@@ -1,7 +1,15 @@
 import os
 import sqlite3
 from datetime import datetime, timedelta
-from ai_scorer import run_scoring_engine
+try:
+    from ai_scorer import run_scoring_engine
+except ImportError:
+    try:
+        from .ai_scorer import run_scoring_engine
+    except ImportError:
+        import sys
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from ai_scorer import run_scoring_engine
 
 def run_scheduler(db_path=None, horizon="All"):
     """

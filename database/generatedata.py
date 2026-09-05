@@ -107,7 +107,16 @@ def generate_large_dataset(db_path=None):
     if db_path is None:
         db_path = os.path.join(base_dir, "railway_planning.db")
 
-    from createdata import init_db
+    try:
+        from createdata import init_db
+    except ImportError:
+        try:
+            from database.createdata import init_db
+        except ImportError:
+            import sys
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            from createdata import init_db
+
     init_db(db_path)
 
     conn = sqlite3.connect(db_path)

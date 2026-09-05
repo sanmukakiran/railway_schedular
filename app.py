@@ -530,13 +530,54 @@ with st.sidebar:
                     conn.commit()
                     # Trigger scorer for new job
                     run_scoring_engine(db_path=DB_PATH)
-                    st.success(f"Work order {j_id} added to {src} queue with AI scoring.")
+
+                    # Retrieve calculated AI score for receipt
+                    cur.execute("SELECT ai_score FROM Jobs WHERE job_id = ?", (j_id,))
+                    s_row = cur.fetchone()
+                    calc_score = round(s_row[0], 1) if s_row and s_row[0] is not None else 0.0
+
+                    st.session_state["recent_submission"] = {
+                        "job_id": j_id,
+                        "track_id": t_id,
+                        "dept": dept,
+                        "src": src,
+                        "task": task,
+                        "severity": severity,
+                        "horizon": horizon,
+                        "duration": duration,
+                        "psr": psr,
+                        "ai_score": calc_score,
+                        "status": "Pending",
+                        "time": datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%H:%M:%S")
+                    }
+                    st.session_state["search_job_query"] = j_id
                     st.rerun()
                 except sqlite3.IntegrityError as err:
                     if "UNIQUE constraint failed" in str(err):
                         st.error(f"Job ID '{j_id}' already exists.")
                     else:
                         st.error(f"Could not save job: {err}")
+
+    st.divider()
+    st.markdown("### Search & Track Requisition")
+    track_lookup_id = st.text_input("Track Requisition Status", placeholder="e.g. JOB-1001 or JOB-XXXX", key="wb_track_lookup")
+    if track_lookup_id:
+        lookup_job = jobs_df[jobs_df["Job ID"].str.upper() == track_lookup_id.strip().upper()] if 'jobs_df' in locals() and not jobs_df.empty else pd.DataFrame()
+        if not lookup_job.empty:
+            rec = lookup_job.iloc[0]
+            st.markdown(f"**Track:** `{rec['Track']} ({rec['Section']})`")
+            st.markdown(f"**Department:** `{rec['Department']} ({rec['Source']})`")
+            st.markdown(f"**AI Priority:** `{rec['AI Score']}/100`")
+            st.markdown(f"**Status:** `{rec['Status']}`")
+            if rec['Status'] == 'Scheduled':
+                b_res = safe_read_sql("SELECT block_id FROM Block_Jobs WHERE job_id = ?", conn, params=(rec['Job ID'],))
+                if not b_res.empty:
+                    blk_num = b_res.iloc[0]['block_id']
+                    st.success(f"Assigned to Shadow Block: {blk_num}")
+            else:
+                st.info("Requisition is currently in the active queue awaiting matching train corridor window.")
+        else:
+            st.warning(f"No record found for ID '{track_lookup_id}'.")
 
 
 # ============================================================
@@ -720,6 +761,44 @@ def apply_chart_theme(fig, title_margin=55, show_legend=None):
 
 
 # ============================================================
+# BDMS REQUISITION RECEIPT BANNER
+# ============================================================
+if st.session_state.get("recent_submission"):
+    sub = st.session_state["recent_submission"]
+    st.markdown(
+        f"""
+        <div style="background: rgba(49, 91, 74, 0.12); border: 1px solid #315b4a; border-left: 6px solid #315b4a; border-radius: 6px; padding: 14px 18px; margin: 15px 0;">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <div>
+                    <span style="font-weight: 700; color: #315b4a; font-size: 0.95em; letter-spacing: 0.5px;">[BDMS RECEIPT] WORK ORDER REGISTERED &amp; SCORED</span>
+                    <span style="margin-left: 10px; font-family: monospace; font-size: 1.15em; font-weight: bold; background: rgba(0,0,0,0.06); padding: 3px 8px; border-radius: 4px;">{sub['job_id']}</span>
+                </div>
+                <div style="font-size: 0.85em; opacity: 0.8;">Registered at {sub['time']} IST</div>
+            </div>
+            <div style="margin-top: 8px; font-size: 0.92em; display: flex; gap: 20px; flex-wrap: wrap;">
+                <span><strong>Corridor:</strong> {sub['track_id']}</span>
+                <span><strong>Department:</strong> {sub['dept']} ({sub['src']})</span>
+                <span><strong>Severity:</strong> {sub['severity']}</span>
+                <span><strong>Duration Needed:</strong> {sub['duration']} mins</span>
+                <span><strong>AI Priority Score:</strong> <span style="font-weight: bold; color: #a84f47; font-size: 1.05em;">{sub['ai_score']} / 100</span></span>
+                <span><strong>Status:</strong> <span style="background: #ded5c3; padding: 2px 7px; border-radius: 3px; font-weight: 600;">{sub['status']}</span> (In Queue)</span>
+            </div>
+            <div style="margin-top: 8px; font-size: 0.85em; opacity: 0.85;">
+                Task: <em>{sub['task']}</em> | Horizon: {sub['horizon']} | Imposed PSR: {sub['psr']} km/h
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+    col_rec1, col_rec2 = st.columns([5, 1])
+    with col_rec2:
+        if st.button("Dismiss Receipt", key="clear_sub_receipt", use_container_width=True):
+            st.session_state["recent_submission"] = None
+            st.session_state["search_job_query"] = ""
+            st.rerun()
+
+
+# ============================================================
 # MAIN TABS: 5-PILLAR RAILWAY MAINTENANCE SYSTEM
 # ============================================================
 tab1, tab2, tab3, tab4, tab5 = st.tabs(
@@ -829,6 +908,34 @@ with tab1:
 with tab2:
     st.markdown('<div class="section-head">Integrated Maintenance Queue across TMS, SMMS &amp; TDMS</div>', unsafe_allow_html=True)
 
+    # Quick Search & Sorting Toolbar
+    c_search, c_sort, c_btn = st.columns([5, 3, 2])
+    with c_search:
+        search_kw = st.text_input(
+            "Search Work Orders",
+            value=st.session_state.get("search_job_query", ""),
+            placeholder="Search by Job ID (e.g. JOB-XXXX), Track (TRK-101), or Task...",
+            key="tab2_search_input",
+            help="Type any Job ID or keyword to immediately locate your request in the backlog."
+        )
+    with c_sort:
+        sort_choice = st.selectbox(
+            "Sort Backlog By",
+            [
+                "AI Priority Score (Highest First)",
+                "Recently Requested (Newest First)",
+                "Overdue Days (Highest First)",
+                "Deadline (Soonest First)"
+            ],
+            key="tab2_sort_choice"
+        )
+    with c_btn:
+        st.write("")
+        st.write("")
+        if st.button("Clear Search", key="btn_clear_tab2_search", use_container_width=True):
+            st.session_state["search_job_query"] = ""
+            st.rerun()
+
     c_src, c_stat, c_sev, c_hor = st.columns(4)
     with c_src:
         src_filter = st.selectbox("Source System", ["All", "TMS (Engineering)", "TDMS (Electrical/TRD)", "SMMS (Signal & Telecom)"])
@@ -840,6 +947,18 @@ with tab2:
         hor_filter = st.selectbox("Horizon", ["All", "Weekly", "Monthly"])
 
     filtered_jobs = jobs_df.copy()
+
+    # Apply Search Keyword
+    if search_kw:
+        skw = search_kw.strip().lower()
+        filtered_jobs = filtered_jobs[
+            filtered_jobs["Job ID"].str.lower().str.contains(skw, na=False) |
+            filtered_jobs["Track"].str.lower().str.contains(skw, na=False) |
+            filtered_jobs["Task Details"].str.lower().str.contains(skw, na=False) |
+            filtered_jobs["Section"].str.lower().str.contains(skw, na=False)
+        ]
+
+    # Apply Dropdown Filters
     if src_filter != "All":
         src_code = src_filter.split()[0]
         filtered_jobs = filtered_jobs[filtered_jobs["Source"] == src_code]
@@ -849,6 +968,16 @@ with tab2:
         filtered_jobs = filtered_jobs[filtered_jobs["Severity"] == sev_filter]
     if hor_filter != "All":
         filtered_jobs = filtered_jobs[filtered_jobs["Horizon"] == hor_filter]
+
+    # Apply Sorting
+    if sort_choice == "Recently Requested (Newest First)":
+        filtered_jobs = filtered_jobs.sort_values("Requested", ascending=False)
+    elif sort_choice == "Overdue Days (Highest First)":
+        filtered_jobs = filtered_jobs.sort_values("Overdue (d)", ascending=False)
+    elif sort_choice == "Deadline (Soonest First)":
+        filtered_jobs = filtered_jobs.sort_values("Deadline", ascending=True)
+    else:
+        filtered_jobs = filtered_jobs.sort_values("AI Score", ascending=False)
 
     st.caption(f"Showing {len(filtered_jobs)} work orders matching filters.")
     render_vintage_table(filtered_jobs, progress_column="AI Score")

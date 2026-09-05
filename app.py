@@ -1,184 +1,48 @@
+import os
 import sqlite3
-import random
+import uuid
 from datetime import datetime, date, timedelta
-from  zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 
 
 # ============================================================
-# DATABASE
+# DATABASE & BACKEND INTEGRATION
 # ============================================================
-DB_PATH = "database/railway_planning.db"
-
-
-@st.cache_resource
-def get_shared_connection():
-    conn = sqlite3.connect(
-        DB_PATH,
-        timeout=30,
-        check_same_thread=False,
-    )
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA busy_timeout=30000;")
-    return conn
-
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, "database", "railway_planning.db")
+if not os.path.exists(DB_PATH):
+    alt_path = os.path.join(BASE_DIR, "railway_planning.db")
+    if os.path.exists(alt_path):
+        DB_PATH = alt_path
 
 def get_connection():
-    return get_shared_connection()
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout=30000;")
+    conn.execute("PRAGMA foreign_keys = ON;")
+    return conn
 
+# Import AI Engine & Data Generation
+import sys
+sys.path.insert(0, BASE_DIR)
+sys.path.insert(0, os.path.join(BASE_DIR, "database"))
 
-# ============================================================
-# AI SCHEDULER
-# ============================================================
-def run_scheduler_pipeline():
-    conn = get_connection()
-    cursor = conn.cursor()
-    blocks_created = 0
+from ai_scorer import run_scoring_engine
+from ai_scheduler import run_scheduler
+from generatedata import generate_large_dataset
 
-    while True:
-        cursor.execute(
-            """
-            SELECT job_id, track_id, min_duration_needed, task, department, ai_score
-            FROM Jobs
-            WHERE status IS NULL OR status = 'Pending'
-            ORDER BY ai_score DESC
-            LIMIT 1
-            """
-        )
-        top_job = cursor.fetchone()
+def run_scheduler_pipeline(horizon="All"):
+    """Runs the AI Prioritization and Coordinated Shadow Block Optimizer."""
+    return run_scheduler(db_path=DB_PATH, horizon=horizon)
 
-        if not top_job:
-            break
-
-        main_job_id, target_track, needed_time, task_name, dept, score = top_job
-
-        cursor.execute(
-            """
-            SELECT availability_id, window_start, window_end
-            FROM Corridor_Availability
-            WHERE track_id = ?
-            LIMIT 1
-            """,
-            (target_track,),
-        )
-        window = cursor.fetchone()
-
-        if not window:
-            cursor.execute(
-                "UPDATE Jobs SET status = 'Delayed' WHERE job_id = ?",
-                (main_job_id,),
-            )
-            conn.commit()
-            continue
-
-        avail_id, block_start, block_end = window
-
-        try:
-            start_dt = datetime.strptime(block_start, "%Y-%m-%d %H:%M:%S")
-            end_dt = datetime.strptime(block_end, "%Y-%m-%d %H:%M:%S")
-        except ValueError:
-            start_dt = datetime.strptime(block_start, "%Y-%m-%d %H:%M")
-            end_dt = datetime.strptime(block_end, "%Y-%m-%d %H:%M")
-
-        available_mins = (end_dt - start_dt).total_seconds() / 60.0
-
-        if needed_time > available_mins:
-            cursor.execute(
-                "UPDATE Jobs SET status = 'Delayed' WHERE job_id = ?",
-                (main_job_id,),
-            )
-            conn.commit()
-            continue
-
-        cursor.execute(
-            """
-            SELECT job_id, task, department, min_duration_needed
-            FROM Jobs
-            WHERE track_id = ?
-              AND job_id != ?
-              AND (status IS NULL OR status = 'Pending')
-            """,
-            (target_track, main_job_id),
-        )
-        other_jobs = cursor.fetchall()
-
-        valid_shadow_jobs = [
-            job_id
-            for job_id, _, _, duration in other_jobs
-            if duration <= available_mins
-        ]
-
-        new_block_id = f"BLK-AI-{main_job_id[-4:]}"
-        total_depts = 1 + len(valid_shadow_jobs)
-
-        try:
-            cursor.execute(
-                """
-                INSERT INTO Block_Register
-                    (block_id, track_id, window_start, window_end,
-                     total_departments_involved)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (new_block_id, target_track, block_start, block_end, total_depts),
-            )
-        except sqlite3.OperationalError:
-            try:
-                cursor.execute(
-                    """
-                    INSERT INTO Block_Register
-                        (block_id, track_id, window_start, window_end,
-                         total_departments)
-                    VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (new_block_id, target_track, block_start, block_end, total_depts),
-                )
-            except sqlite3.OperationalError:
-                cursor.execute(
-                    """
-                    INSERT INTO Block_Register
-                        (block_id, track_id, window_start, window_end)
-                    VALUES (?, ?, ?, ?)
-                    """,
-                    (new_block_id, target_track, block_start, block_end),
-                )
-
-        cursor.execute(
-            "INSERT INTO Block_Jobs (block_id, job_id) VALUES (?, ?)",
-            (new_block_id, main_job_id),
-        )
-        cursor.execute(
-            "UPDATE Jobs SET status = 'Scheduled' WHERE job_id = ?",
-            (main_job_id,),
-        )
-
-        for valid_id in valid_shadow_jobs:
-            cursor.execute(
-                "INSERT INTO Block_Jobs (block_id, job_id) VALUES (?, ?)",
-                (new_block_id, valid_id),
-            )
-            cursor.execute(
-                "UPDATE Jobs SET status = 'Scheduled' WHERE job_id = ?",
-                (valid_id,),
-            )
-
-        conn.commit()
-        blocks_created += 1
-
-    return blocks_created
-
-
-# ============================================================
-# RESET DATABASE
-# ============================================================
 def reset_database():
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM Block_Jobs")
-    cur.execute("DELETE FROM Block_Register")
-    cur.execute("UPDATE Jobs SET status = 'Pending'")
-    conn.commit()
+    """Regenerates the complete authentic Indian Railways dataset."""
+    generate_large_dataset(db_path=DB_PATH)
+    run_scoring_engine(db_path=DB_PATH, score_all=True)
 
 
 # ============================================================
@@ -246,18 +110,12 @@ if "dashboard_theme" not in st.session_state:
 
 st.set_page_config(
     page_title="AI Rail Corridor Scheduler",
-    page_icon="🚆",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
 theme_name = st.session_state.dashboard_theme
 
-# The theme actually used to color Plotly charts and to set an explicit
-# color-scheme on inputs. "System" can't be resolved from Python (Streamlit
-# has no server-side signal for OS/browser preference), so it renders with
-# the Light palette by default while the page CSS still adapts to the
-# browser's preference via the prefers-color-scheme media query below.
 resolved_theme = THEMES["Dark"] if theme_name == "Dark" else THEMES["Light"]
 
 root_css = f":root{{{css_vars_block(resolved_theme)}color-scheme:{resolved_theme['color_scheme']};}}"
@@ -292,7 +150,7 @@ html, body, [class*="css"] {{ font-family:'Source Sans 3',Arial,sans-serif; }}
 .brand-sub {{ font-size:9px;color:var(--muted);margin-top:2px;text-transform:uppercase;letter-spacing:1px; }}
 .topbar-right {{ display:flex; align-items:center; gap:8px; }}
 .system-state {{ font-size:10px;color:var(--green);border:1px solid var(--green);background:var(--panel2);padding:5px 9px;border-radius:1px;letter-spacing:.5px;font-weight:600;white-space:nowrap; }}
-.system-state::before {{ content:"●"; margin-right:5px; }}
+.system-state::before {{ content:"[ONLINE] "; margin-right:3px; }}
 .clock-chip {{ font-size:10px;color:var(--muted);border:1px solid var(--line);background:var(--panel2);padding:5px 9px;border-radius:1px;white-space:nowrap; }}
 div[data-testid="stMetric"] {{ min-height:82px;padding:12px 15px;background:var(--panel);border:1px solid var(--line);border-radius:1px;box-shadow:var(--shadow);border-top:3px solid var(--brass); }}
 div[data-testid="stMetric"]:hover {{ border-color:var(--brass); }}
@@ -413,7 +271,7 @@ st.markdown(
 <div class="brand-logo"><img src="https://png.pngtree.com/png-vector/20230109/ourmid/pngtree-train-on-a-white-background-png-image_6556767.png" alt="Train"></div>
 <div>
 <div class="brand-title">Railway Corridor Maintenance Management</div>
-<div class="brand-sub">OPERATIONS &nbsp;•&nbsp; WAY &amp; WORKS &nbsp;•&nbsp; MAINTENANCE</div>
+<div class="brand-sub">OPERATIONS &nbsp;|&nbsp; WAY &amp; WORKS &nbsp;|&nbsp; MAINTENANCE</div>
 </div>
 </div>
 <div class="topbar-right">
@@ -429,41 +287,51 @@ st.markdown(
 # ============================================================
 # CONNECTION + KPI DATA
 # ============================================================
+# CONNECTION + KPI DATA
+# ============================================================
 conn = get_connection()
 
-
 def count_query(sql):
-    return int(pd.read_sql_query(sql, conn)["c"].iloc[0])
-
+    try:
+        return int(pd.read_sql_query(sql, conn)["c"].iloc[0])
+    except Exception:
+        return 0
 
 total_jobs = count_query("SELECT COUNT(*) AS c FROM Jobs")
-pending_jobs = count_query(
-    "SELECT COUNT(*) AS c FROM Jobs WHERE status IS NULL OR status = 'Pending'"
-)
-scheduled_jobs = count_query(
-    "SELECT COUNT(*) AS c FROM Jobs WHERE status = 'Scheduled'"
-)
-delayed_jobs = count_query(
-    "SELECT COUNT(*) AS c FROM Jobs WHERE status = 'Delayed'"
-)
+pending_jobs = count_query("SELECT COUNT(*) AS c FROM Jobs WHERE status IS NULL OR status = 'Pending'")
+scheduled_jobs = count_query("SELECT COUNT(*) AS c FROM Jobs WHERE status = 'Scheduled'")
+delayed_jobs = count_query("SELECT COUNT(*) AS c FROM Jobs WHERE status = 'Delayed'")
 total_blocks = count_query("SELECT COUNT(*) AS c FROM Block_Register")
+
+try:
+    total_downtime_saved_mins = int(pd.read_sql_query("SELECT COALESCE(SUM(corridor_downtime_saved_mins), 0) AS s FROM Block_Register", conn)["s"].iloc[0])
+except Exception:
+    total_downtime_saved_mins = 0
+
+try:
+    total_maint_time = int(pd.read_sql_query("SELECT COALESCE(SUM(min_duration_needed), 1) AS s FROM Jobs WHERE status = 'Scheduled'", conn)["s"].iloc[0])
+    uptime_gain_pct = round((total_downtime_saved_mins / max(total_maint_time, 1)) * 100.0, 1)
+except Exception:
+    uptime_gain_pct = 0.0
 
 
 # ============================================================
 # KPI ROW
 # ============================================================
-k1, k2, k3, k4, k5 = st.columns(5)
+k1, k2, k3, k4, k5, k6 = st.columns(6)
 
 with k1:
     st.metric("Total Jobs", total_jobs)
 with k2:
-    st.metric("Pending", pending_jobs)
+    st.metric("Pending / Delayed", f"{pending_jobs} / {delayed_jobs}")
 with k3:
-    st.metric("Scheduled", scheduled_jobs)
+    st.metric("Scheduled Jobs", scheduled_jobs)
 with k4:
-    st.metric("Delayed", delayed_jobs)
-with k5:
     st.metric("Shadow Blocks", total_blocks)
+with k5:
+    st.metric("Downtime Saved", f"{round(total_downtime_saved_mins/60, 1)} hrs")
+with k6:
+    st.metric("Asset Uptime Gain", f"{uptime_gain_pct}%")
 
 
 # ============================================================
@@ -472,50 +340,84 @@ with k5:
 with st.sidebar:
     st.markdown("## Operations Office")
 
-    # Bound directly to session_state via `key` — Streamlit reruns the
-    # app automatically on change, so no manual comparison/rerun needed.
     st.selectbox(
         "Dashboard Theme",
         ["System", "Light", "Dark"],
         key="dashboard_theme",
-        help="System follows your browser/OS preference for page colors. Charts use the Light palette while System is selected.",
+        help="System follows your browser/OS preference for page colors.",
     )
+
+    selected_horizon = st.selectbox(
+        "Planning Horizon",
+        ["All Horizons", "Weekly (7-Day Rolling)", "Monthly (30-Day Strategic)"],
+        index=0,
+        help="Filter optimization and block schedules by operational planning horizon."
+    )
+    horizon_param = "Weekly" if "Weekly" in selected_horizon else ("Monthly" if "Monthly" in selected_horizon else "All")
 
     st.write("")
 
-    if st.button("▶ Run Maintenance Scheduler", type="primary", use_container_width=True):
-        with st.spinner("Checking corridor availability and maintenance conflicts..."):
-            count = run_scheduler_pipeline()
+    if st.button("Run Coordinated Optimizer", type="primary", use_container_width=True):
+        with st.spinner("Executing AI Prioritization and Coordinated Shadow Block Scheduling..."):
+            count = run_scheduler_pipeline(horizon=horizon_param)
 
         if count > 0:
-            st.success(f"Created {count} maintenance block(s)")
+            st.success(f"Generated {count} Coordinated Block(s) across departments!")
         else:
-            st.info("No pending jobs fit the available corridor windows.")
+            st.info("No matching pending jobs fit available corridor windows.")
         st.rerun()
 
-    if st.button("↺ Reset Demo Database", use_container_width=True):
-        reset_database()
-        st.success("Database reset successfully.")
+    if st.button("Reset & Regenerate Database", use_container_width=True):
+        with st.spinner("Regenerating authentic TMS, SMMS, TDMS & COA dataset..."):
+            reset_database()
+        st.success("Database cleanly re-initialized with 30-day timetable!")
         st.rerun()
 
     st.divider()
-    st.markdown("### + New Work Order")
+    st.markdown("### + BDMS Maintenance Request")
+
+    # Fetch track list for dropdown
+    try:
+        track_list = pd.read_sql_query("SELECT track_id, section_name FROM Tracks ORDER BY track_id", conn)
+        track_choices = [f"{r['track_id']} ({r['section_name'][:24]})" for _, r in track_list.iterrows()]
+    except Exception:
+        track_choices = ["TRK-101", "TRK-102", "TRK-103"]
 
     with st.form("new_job_form", clear_on_submit=True):
-        auto_id = f"JOB-{random.randint(5000, 99999)}"
+        auto_id = f"JOB-{uuid.uuid4().hex[:6].upper()}"
 
-        j_id = st.text_input("Job ID", value=auto_id)
-        t_id = st.text_input("Track ID", value="TRK-121")
-        dept = st.selectbox("Department", ["Civil", "Electrical", "S&T", "Traffic"])
-        task = st.text_input("Task Description", value="Ballast Shoulder Cleaning")
-        severity = st.selectbox("Defect Severity", ["Low", "Medium", "High", "Critical"], index=1)
-        duration = st.number_input("Duration (min)", min_value=15, max_value=480, value=60)
+        j_id = st.text_input("Work Order ID", value=auto_id)
+        t_choice = st.selectbox("Corridor Track", track_choices)
+        t_id = t_choice.split()[0] if t_choice else "TRK-101"
+
+        dept_choice = st.selectbox("Department & Source", [
+            "TMS - Engineering (P-Way)",
+            "TDMS - Traction Distribution (TRD)",
+            "SMMS - Signal & Telecom (S&T)"
+        ])
+        if "TMS" in dept_choice:
+            dept = "Engineering (P-Way)"
+            src = "TMS"
+        elif "TDMS" in dept_choice:
+            dept = "Traction Distribution (TRD)"
+            src = "TDMS"
+        else:
+            dept = "Signal & Telecom (S&T)"
+            src = "SMMS"
+
+        m_type = st.selectbox("Maintenance Type", ["Defect Rectification", "Overdue Cyclic Maintenance", "Preventive Overhaul"])
+        task = st.text_input("Task Description", value="Ultrasonic Flaw Defect (USFD) Removal")
+        severity = st.selectbox("Defect Severity", ["Critical", "High", "Medium", "Low"], index=1)
+        overdue = st.number_input("Overdue Days", min_value=0, max_value=90, value=0)
+        psr = st.selectbox("Speed Restriction Imposed (km/h)", [0, 30, 45, 60], index=0)
+        duration = st.number_input("Duration Needed (min)", min_value=15, max_value=480, value=90)
+        power_req = st.checkbox("Power Block Required (25kV OHE Isolation)", value=("TDMS" in src))
+        horizon = st.selectbox("Horizon", ["Weekly", "Monthly"], index=0)
         req_date = st.date_input("Request Date", value=date.today())
         deadline_date = st.date_input("Deadline", value=date.today() + timedelta(days=7))
-        score = st.slider("Priority Score", min_value=1.0, max_value=100.0, value=75.0)
 
         submitted = st.form_submit_button(
-            "Submit Work Order",
+            "Submit Work Order to BDMS",
             use_container_width=True,
             type="primary",
         )
@@ -531,24 +433,24 @@ with st.sidebar:
                     cur.execute(
                         """
                         INSERT INTO Jobs
-                            (job_id, track_id, department, task, defect_severity,
-                             min_duration_needed, request_date, deadline, status, ai_score)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Pending', ?)
+                            (job_id, track_id, department, source_system, maintenance_type,
+                             task, defect_severity, overdue_days, speed_restriction_imposed,
+                             min_duration_needed, power_block_required, traffic_block_required,
+                             planning_horizon, request_date, deadline, status, ai_score)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, 'Pending', NULL)
                         """,
                         (
-                            j_id,
-                            t_id,
-                            dept,
-                            task,
-                            severity,
-                            duration,
-                            req_date.strftime("%Y-%m-%d"),
+                            j_id, t_id, dept, src, m_type,
+                            task, severity, overdue, psr,
+                            duration, 1 if power_req else 0,
+                            horizon, req_date.strftime("%Y-%m-%d"),
                             deadline_date.strftime("%Y-%m-%d"),
-                            score,
                         ),
                     )
                     conn.commit()
-                    st.success(f"Work order {j_id} added to the maintenance queue.")
+                    # Trigger scorer for new job
+                    run_scoring_engine(db_path=DB_PATH)
+                    st.success(f"Work order {j_id} added to {src} queue with AI scoring.")
                     st.rerun()
                 except sqlite3.IntegrityError as err:
                     if "UNIQUE constraint failed" in str(err):
@@ -565,12 +467,19 @@ blocks_df = pd.read_sql_query(
     SELECT
         b.block_id AS 'Block ID',
         b.track_id AS 'Track',
+        t.section_name AS 'Corridor Section',
         b.window_start AS 'Window Start',
         b.window_end AS 'Window End',
-        COUNT(bj.job_id) AS 'Bundled Tasks'
+        b.duration_mins AS 'Duration (m)',
+        b.total_departments_involved AS 'Depts Involved',
+        b.departments_list AS 'Consolidated Departments',
+        b.tasks_count AS 'Tasks Bundled',
+        CASE WHEN b.power_block_granted = 1 THEN 'Yes (OHE Off)' ELSE 'No' END AS 'Power Block',
+        b.corridor_downtime_saved_mins AS 'Downtime Saved (m)',
+        b.planning_horizon AS 'Horizon',
+        b.status AS 'Status'
     FROM Block_Register b
-    LEFT JOIN Block_Jobs bj ON b.block_id = bj.block_id
-    GROUP BY b.block_id
+    LEFT JOIN Tracks t ON b.track_id = t.track_id
     ORDER BY b.window_start ASC
     """,
     conn,
@@ -579,18 +488,26 @@ blocks_df = pd.read_sql_query(
 jobs_df = pd.read_sql_query(
     """
     SELECT
-        job_id AS 'Job ID',
-        track_id AS 'Track',
-        department AS 'Department',
-        task AS 'Task',
-        defect_severity AS 'Severity',
-        min_duration_needed AS 'Duration (m)',
-        request_date AS 'Requested',
-        deadline AS 'Deadline',
-        ai_score AS 'AI Score',
-        COALESCE(status, 'Pending') AS 'Status'
-    FROM Jobs
-    ORDER BY ai_score DESC
+        j.job_id AS 'Job ID',
+        j.track_id AS 'Track',
+        t.section_name AS 'Section',
+        j.source_system AS 'Source',
+        j.department AS 'Department',
+        j.maintenance_type AS 'Type',
+        j.task AS 'Task Details',
+        j.defect_severity AS 'Severity',
+        j.overdue_days AS 'Overdue (d)',
+        j.speed_restriction_imposed AS 'PSR (km/h)',
+        j.min_duration_needed AS 'Duration (m)',
+        CASE WHEN j.power_block_required = 1 THEN 'Yes' ELSE 'No' END AS 'Power Req',
+        j.planning_horizon AS 'Horizon',
+        j.request_date AS 'Requested',
+        j.deadline AS 'Deadline',
+        j.ai_score AS 'AI Score',
+        COALESCE(j.status, 'Pending') AS 'Status'
+    FROM Jobs j
+    LEFT JOIN Tracks t ON j.track_id = t.track_id
+    ORDER BY j.ai_score DESC
     """,
     conn,
 )
@@ -598,12 +515,35 @@ jobs_df = pd.read_sql_query(
 avail_df = pd.read_sql_query(
     """
     SELECT
-        availability_id AS 'Window ID',
-        track_id AS 'Track',
-        window_start AS 'Available From',
-        window_end AS 'Available Until'
-    FROM Corridor_Availability
-    ORDER BY window_start ASC
+        a.availability_id AS 'Window ID',
+        a.track_id AS 'Track',
+        t.section_name AS 'Section',
+        a.available_date AS 'Date',
+        a.window_start AS 'Available From',
+        a.window_end AS 'Available Until',
+        a.duration_mins AS 'Duration (m)',
+        a.window_type AS 'Window Type'
+    FROM Corridor_Availability a
+    LEFT JOIN Tracks t ON a.track_id = t.track_id
+    ORDER BY a.available_date ASC, a.window_start ASC
+    """,
+    conn,
+)
+
+trains_df = pd.read_sql_query(
+    """
+    SELECT
+        tr.train_id AS 'Instance ID',
+        tr.train_number AS 'Train No.',
+        tr.train_name AS 'Train Name',
+        tr.train_type AS 'Category',
+        tr.track_id AS 'Track',
+        tr.run_date AS 'Date',
+        tr.scheduled_arrival AS 'Arrival',
+        tr.scheduled_departure AS 'Departure',
+        tr.flexibility_mins AS 'Flexibility (m)'
+    FROM Trains tr
+    ORDER BY tr.run_date ASC, tr.scheduled_arrival ASC
     """,
     conn,
 )
@@ -664,71 +604,7 @@ def render_vintage_table(df, progress_column=None):
 
 
 # ============================================================
-# MAIN TABS
-# ============================================================
-tab1, tab2, tab3, tab4 = st.tabs(
-    ["Shadow Blocks", "Job Queue", "Corridor Gaps", "Analytics"]
-)
-
-
-# ============================================================
-# TAB 1 - SHADOW BLOCKS
-# ============================================================
-with tab1:
-    st.markdown('<div class="section-head">Consolidated Maintenance Blocks</div>', unsafe_allow_html=True)
-
-    if blocks_df.empty:
-        st.markdown(
-            '<div class="info-box">No Shadow Blocks registered yet. Use <b>Run Maintenance Scheduler</b> from the Operations Office.</div>',
-            unsafe_allow_html=True,
-        )
-    else:
-        render_vintage_table(blocks_df)
-
-        st.markdown('<div class="section-head">Block Task Mapping</div>', unsafe_allow_html=True)
-        selected_block = st.selectbox("Select a block", blocks_df["Block ID"].unique())
-
-        details_df = pd.read_sql_query(
-            """
-            SELECT
-                j.job_id AS 'Job ID',
-                j.department AS 'Department',
-                j.task AS 'Task Details',
-                j.min_duration_needed AS 'Duration (m)',
-                j.ai_score AS 'Priority Score'
-            FROM Block_Jobs bj
-            JOIN Jobs j ON bj.job_id = j.job_id
-            WHERE bj.block_id = ?
-            """,
-            conn,
-            params=(selected_block,),
-        )
-
-        render_vintage_table(details_df, progress_column="Priority Score")
-
-
-# ============================================================
-# TAB 2 - JOB QUEUE
-# ============================================================
-with tab2:
-    st.markdown('<div class="section-head">Job Priority &amp; Scheduling Status</div>', unsafe_allow_html=True)
-
-    status_filter = st.radio(
-        "Filter by status",
-        ["All", "Pending", "Scheduled", "Delayed"],
-        horizontal=True,
-        label_visibility="collapsed",
-    )
-
-    filtered_jobs = jobs_df.copy()
-    if status_filter != "All":
-        filtered_jobs = filtered_jobs[filtered_jobs["Status"] == status_filter]
-
-    render_vintage_table(filtered_jobs, progress_column="AI Score")
-
-
-# ============================================================
-# CHART THEME — single helper, no per-chart color duplication
+# CHART THEME HELPER
 # ============================================================
 def apply_chart_theme(fig, title_margin=55, show_legend=None):
     fig.update_layout(
@@ -746,44 +622,268 @@ def apply_chart_theme(fig, title_margin=55, show_legend=None):
 
 
 # ============================================================
-# TAB 3 - CORRIDOR GAPS
+# MAIN TABS: 5-PILLAR RAILWAY MAINTENANCE SYSTEM
+# ============================================================
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    [
+        "Shadow Blocks", 
+        "Integrated Backlog (TMS/SMMS/TDMS)", 
+        "Corridor Availability (COA)", 
+        "Multi-Horizon Planning", 
+        "AI Engine & Analytics"
+    ]
+)
+
+
+# ============================================================
+# TAB 1 - COORDINATED SHADOW BLOCKS
+# ============================================================
+with tab1:
+    st.markdown('<div class="section-head">Coordinated Multi-Department Block Register (Joint Possessions)</div>', unsafe_allow_html=True)
+    st.caption("Bundles compatible tasks across Engineering (TMS), Traction Distribution (TDMS), and Signal & Telecom (SMMS) to minimize corridor downtime.")
+
+    if blocks_df.empty:
+        st.markdown(
+            '<div class="info-box">No Coordinated Blocks registered yet. Use <b>Run Coordinated Optimizer</b> from the Operations Office.</div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        # Horizon filter for blocks
+        col_f1, col_f2 = st.columns([1, 2])
+        with col_f1:
+            blk_horizon_filter = st.selectbox("Filter Block Horizon", ["All", "Weekly", "Monthly"], key="blk_horizon_f")
+        with col_f2:
+            blk_track_filter = st.selectbox("Filter Track", ["All Tracks"] + sorted(list(blocks_df["Track"].unique())), key="blk_trk_f")
+
+        filtered_blocks = blocks_df.copy()
+        if blk_horizon_filter != "All":
+            filtered_blocks = filtered_blocks[filtered_blocks["Horizon"] == blk_horizon_filter]
+        if blk_track_filter != "All Tracks":
+            filtered_blocks = filtered_blocks[filtered_blocks["Track"] == blk_track_filter]
+
+        render_vintage_table(filtered_blocks)
+
+        # Interactive Block Task Drill-Down
+        st.markdown('<div class="section-head">Block Task Mapping & Departmental Coordination</div>', unsafe_allow_html=True)
+        block_options = filtered_blocks["Block ID"].unique() if not filtered_blocks.empty else blocks_df["Block ID"].unique()
+        
+        selected_block = st.selectbox("Select Block to inspect bundled tasks", block_options, key="select_block_details")
+
+        details_df = pd.read_sql_query(
+            """
+            SELECT
+                j.job_id AS 'Job ID',
+                j.source_system AS 'Source',
+                j.department AS 'Department',
+                j.maintenance_type AS 'Type',
+                j.task AS 'Task Details',
+                j.defect_severity AS 'Severity',
+                j.overdue_days AS 'Overdue (d)',
+                j.min_duration_needed AS 'Duration (m)',
+                CASE WHEN j.power_block_required = 1 THEN 'Yes' ELSE 'No' END AS 'OHE Power Off',
+                j.ai_score AS 'AI Priority'
+            FROM Block_Jobs bj
+            JOIN Jobs j ON bj.job_id = j.job_id
+            WHERE bj.block_id = ?
+            ORDER BY j.ai_score DESC
+            """,
+            conn,
+            params=(selected_block,),
+        )
+
+        render_vintage_table(details_df, progress_column="AI Priority")
+
+        # Visual Gantt of blocks
+        if not filtered_blocks.empty:
+            st.markdown('<div class="section-head">Corridor Possession Timeline</div>', unsafe_allow_html=True)
+            gantt_df = filtered_blocks.head(25).copy()
+            gantt_df["Start"] = pd.to_datetime(gantt_df["Window Start"])
+            gantt_df["End"] = pd.to_datetime(gantt_df["Window End"])
+
+            fig_blk_gantt = px.timeline(
+                gantt_df,
+                x_start="Start",
+                x_end="End",
+                y="Track",
+                color="Depts Involved",
+                hover_data=["Block ID", "Consolidated Departments", "Downtime Saved (m)"],
+                title="Coordinated Possessions Timeline by Track",
+                color_continuous_scale=resolved_theme["dept_scale"],
+            )
+            fig_blk_gantt.update_yaxes(autorange="reversed")
+            fig_blk_gantt = apply_chart_theme(fig_blk_gantt, show_legend=True)
+            st.plotly_chart(fig_blk_gantt, use_container_width=True, config={"displaylogo": False})
+
+
+# ============================================================
+# TAB 2 - INTEGRATED MAINTENANCE BACKLOG (TMS / SMMS / TDMS)
+# ============================================================
+with tab2:
+    st.markdown('<div class="section-head">Integrated Maintenance Queue across TMS, SMMS &amp; TDMS</div>', unsafe_allow_html=True)
+
+    c_src, c_stat, c_sev, c_hor = st.columns(4)
+    with c_src:
+        src_filter = st.selectbox("Source System", ["All", "TMS (Engineering)", "TDMS (Electrical/TRD)", "SMMS (Signal & Telecom)"])
+    with c_stat:
+        status_filter = st.selectbox("Status", ["All", "Scheduled", "Pending", "Delayed"])
+    with c_sev:
+        sev_filter = st.selectbox("Severity", ["All", "Critical", "High", "Medium", "Low"])
+    with c_hor:
+        hor_filter = st.selectbox("Horizon", ["All", "Weekly", "Monthly"])
+
+    filtered_jobs = jobs_df.copy()
+    if src_filter != "All":
+        src_code = src_filter.split()[0]
+        filtered_jobs = filtered_jobs[filtered_jobs["Source"] == src_code]
+    if status_filter != "All":
+        filtered_jobs = filtered_jobs[filtered_jobs["Status"] == status_filter]
+    if sev_filter != "All":
+        filtered_jobs = filtered_jobs[filtered_jobs["Severity"] == sev_filter]
+    if hor_filter != "All":
+        filtered_jobs = filtered_jobs[filtered_jobs["Horizon"] == hor_filter]
+
+    st.caption(f"Showing {len(filtered_jobs)} work orders matching filters.")
+    render_vintage_table(filtered_jobs, progress_column="AI Score")
+
+
+# ============================================================
+# TAB 3 - CORRIDOR AVAILABILITY & TRAFFIC MANAGEMENT (COA)
 # ============================================================
 with tab3:
-    st.markdown('<div class="section-head">Available Corridor Timetables</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-head">Control Office Application (COA) Corridor Availability &amp; Timetables</div>', unsafe_allow_html=True)
 
-    render_vintage_table(avail_df)
+    coa_view = st.radio("COA Data View", ["Candidate Free Corridor Windows", "Passenger Timetables & Goods Trains Forecast"], horizontal=True)
 
-    if not avail_df.empty:
-        timeline_df = avail_df.copy()
-        timeline_df["Available From"] = pd.to_datetime(timeline_df["Available From"])
-        timeline_df["Available Until"] = pd.to_datetime(timeline_df["Available Until"])
+    if coa_view == "Candidate Free Corridor Windows":
+        col_a1, col_a2 = st.columns(2)
+        with col_a1:
+            avail_trk = st.selectbox("Filter Corridor Track", ["All Tracks"] + sorted(list(avail_df["Track"].unique())), key="avail_trk")
+        with col_a2:
+            avail_wtype = st.selectbox("Window Type", ["All Types", "Natural Train Gap", "Goods Regulated Window", "Night Corridor Gap"])
 
-        fig = px.timeline(
-            timeline_df,
-            x_start="Available From",
-            x_end="Available Until",
-            y="Track",
-            color="Track",
-            hover_data=["Window ID"],
-            title="Corridor Availability Timeline",
-        )
-        fig.update_yaxes(autorange="reversed", showgrid=False)
-        fig = apply_chart_theme(fig, show_legend=False)
-        st.plotly_chart(fig, use_container_width=True, config={"displaylogo": False})
+        filtered_avail = avail_df.copy()
+        if avail_trk != "All Tracks":
+            filtered_avail = filtered_avail[filtered_avail["Track"] == avail_trk]
+        if avail_wtype != "All Types":
+            filtered_avail = filtered_avail[filtered_avail["Window Type"] == avail_wtype]
+
+        render_vintage_table(filtered_avail.head(40))
+
+        if not filtered_avail.empty:
+            timeline_df = filtered_avail.head(30).copy()
+            timeline_df["Available From"] = pd.to_datetime(timeline_df["Available From"])
+            timeline_df["Available Until"] = pd.to_datetime(timeline_df["Available Until"])
+
+            fig_avail = px.timeline(
+                timeline_df,
+                x_start="Available From",
+                x_end="Available Until",
+                y="Track",
+                color="Window Type",
+                hover_data=["Window ID", "Duration (m)"],
+                title="Free Corridor Maintenance Windows Timeline",
+            )
+            fig_avail.update_yaxes(autorange="reversed", showgrid=False)
+            fig_avail = apply_chart_theme(fig_avail, show_legend=True)
+            st.plotly_chart(fig_avail, use_container_width=True, config={"displaylogo": False})
+
+    else:
+        st.markdown('<div class="section-head">Passenger Timetable &amp; COA Freight Corridor Forecast</div>', unsafe_allow_html=True)
+        col_t1, col_t2 = st.columns(2)
+        with col_t1:
+            train_cat = st.selectbox("Filter Category", ["All Categories", "Passenger Premium", "Passenger Express", "Goods Forecast - Coal", "Goods Forecast - Container", "Goods Forecast - POL", "Goods Forecast - Steel", "Goods Forecast - General"])
+        with col_t2:
+            train_trk = st.selectbox("Filter Track Section", ["All Tracks"] + sorted(list(trains_df["Track"].unique())), key="trn_trk")
+
+        filtered_trains = trains_df.copy()
+        if train_cat != "All Categories":
+            filtered_trains = filtered_trains[filtered_trains["Category"] == train_cat]
+        if train_trk != "All Tracks":
+            filtered_trains = filtered_trains[filtered_trains["Track"] == train_trk]
+
+        render_vintage_table(filtered_trains.head(45))
 
 
 # ============================================================
-# TAB 4 - ANALYTICS
+# TAB 4 - MULTI-HORIZON PLANNING (WEEKLY & MONTHLY)
 # ============================================================
 with tab4:
-    st.markdown('<div class="section-head">Operations Analytics</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-head">Multi-Horizon Maintenance Planning (Weekly &amp; Monthly)</div>', unsafe_allow_html=True)
+    st.caption("Balances immediate tactical safety repairs (7-day rolling) with heavy machinery strategic overhauls (30-day lookahead).")
+
+    h_choice = st.radio("Select Planning Horizon View", ["Weekly Operational Plan (Days 1 - 7)", "Monthly Strategic Schedule (Days 1 - 30)"], horizontal=True)
+
+    if "Weekly" in h_choice:
+        st.markdown('<div class="section-head">Weekly Tactical Plan (Immediate Defect Rectifications &amp; Rolling Possessions)</div>', unsafe_allow_html=True)
+        weekly_jobs = jobs_df[jobs_df["Horizon"] == "Weekly"].copy()
+        weekly_blocks = blocks_df[blocks_df["Horizon"] == "Weekly"].copy()
+
+        m1, m2, m3 = st.columns(3)
+        with m1:
+            st.metric("Weekly Active Jobs", len(weekly_jobs))
+        with m2:
+            st.metric("Weekly Coordinated Blocks", len(weekly_blocks))
+        with m3:
+            w_downtime = weekly_blocks["Downtime Saved (m)"].sum() if not weekly_blocks.empty else 0
+            st.metric("Weekly Corridor Downtime Saved", f"{round(w_downtime/60, 1)} hrs")
+
+        render_vintage_table(weekly_blocks)
+
+        if not weekly_jobs.empty:
+            st.markdown('<div class="section-head">Weekly Defect Resolution Queue by Department</div>', unsafe_allow_html=True)
+            fig_w = px.histogram(
+                weekly_jobs,
+                x="Department",
+                color="Status",
+                barmode="group",
+                color_discrete_map=resolved_theme["status_colors"],
+                title="Weekly Work Order Execution by Department",
+            )
+            fig_w = apply_chart_theme(fig_w)
+            st.plotly_chart(fig_w, use_container_width=True, config={"displaylogo": False})
+
+    else:
+        st.markdown('<div class="section-head">Monthly Strategic Horizon (Heavy Machinery &amp; Track Renewal Cycles)</div>', unsafe_allow_html=True)
+        monthly_jobs = jobs_df[jobs_df["Horizon"] == "Monthly"].copy()
+        monthly_blocks = blocks_df[blocks_df["Horizon"] == "Monthly"].copy()
+
+        m1, m2, m3 = st.columns(3)
+        with m1:
+            st.metric("Monthly Strategic Jobs", len(monthly_jobs))
+        with m2:
+            st.metric("Monthly Coordinated Mega-Blocks", len(monthly_blocks))
+        with m3:
+            m_downtime = monthly_blocks["Downtime Saved (m)"].sum() if not monthly_blocks.empty else 0
+            st.metric("Monthly Corridor Downtime Saved", f"{round(m_downtime/60, 1)} hrs")
+
+        render_vintage_table(monthly_blocks)
+
+        if not monthly_jobs.empty:
+            st.markdown('<div class="section-head">30-Day Heavy Maintenance Allocation by Track</div>', unsafe_allow_html=True)
+            trk_work = monthly_jobs.groupby(["Track", "Type"]).size().reset_index(name="Count")
+            fig_m = px.bar(
+                trk_work,
+                x="Track",
+                y="Count",
+                color="Type",
+                title="30-Day Maintenance Distribution across Corridors",
+            )
+            fig_m = apply_chart_theme(fig_m)
+            st.plotly_chart(fig_m, use_container_width=True, config={"displaylogo": False})
+
+
+# ============================================================
+# TAB 5 - AI ENGINE & OPERATIONS ANALYTICS
+# ============================================================
+with tab5:
+    st.markdown('<div class="section-head">AI Prioritization &amp; Coordinated Scheduling Analytics</div>', unsafe_allow_html=True)
 
     if jobs_df.empty:
         st.info("No job data available for analytics.")
     else:
-        chart1, chart2 = st.columns(2)
+        c1, c2 = st.columns(2)
 
-        with chart1:
+        with c1:
             status_data = pd.DataFrame(
                 {
                     "Status": ["Scheduled", "Pending", "Delayed"],
@@ -794,33 +894,35 @@ with tab4:
                 status_data,
                 names="Status",
                 values="Count",
-                hole=0.68,
+                hole=0.65,
                 color="Status",
                 color_discrete_map=resolved_theme["status_colors"],
-                title="Job Status Distribution",
+                title="Work Order Scheduling Status",
             )
             fig_status = apply_chart_theme(fig_status)
             fig_status.update_layout(legend=dict(orientation="h", y=-0.08))
             st.plotly_chart(fig_status, use_container_width=True, config={"displaylogo": False})
 
-        with chart2:
-            dept_data = jobs_df.groupby("Department").size().reset_index(name="Jobs")
+        with c2:
+            dept_data = jobs_df.groupby("Source").size().reset_index(name="Jobs")
+            dept_map = {"TMS": "TMS (Civil/P-Way)", "TDMS": "TDMS (Electrical/TRD)", "SMMS": "SMMS (Signal & Telecom)"}
+            dept_data["System"] = dept_data["Source"].map(lambda s: dept_map.get(s, s))
             fig_dept = px.bar(
                 dept_data,
-                x="Department",
+                x="System",
                 y="Jobs",
                 text="Jobs",
                 color="Jobs",
                 color_continuous_scale=resolved_theme["dept_scale"],
-                title="Department Workload",
+                title="Departmental Backlog Distribution (TMS vs TDMS vs SMMS)",
             )
             fig_dept.update_layout(coloraxis_showscale=False, xaxis=dict(showgrid=False))
             fig_dept = apply_chart_theme(fig_dept)
             st.plotly_chart(fig_dept, use_container_width=True, config={"displaylogo": False})
 
-        chart3, chart4 = st.columns(2)
+        c3, c4 = st.columns(2)
 
-        with chart3:
+        with c3:
             fig_priority = px.histogram(
                 jobs_df,
                 x="AI Score",
@@ -832,46 +934,49 @@ with tab4:
             fig_priority = apply_chart_theme(fig_priority)
             st.plotly_chart(fig_priority, use_container_width=True, config={"displaylogo": False})
 
-        with chart4:
-            severity_data = jobs_df.groupby("Severity").size().reset_index(name="Jobs")
-            severity_order = ["Low", "Medium", "High", "Critical"]
-            severity_data["Severity"] = pd.Categorical(
-                severity_data["Severity"], categories=severity_order, ordered=True
+        with c4:
+            # AI Factor Contributions Breakdown
+            ai_factors_df = pd.DataFrame({
+                "Evaluation Factor": [
+                    "Safety & Defect Severity Risk",
+                    "Statutory Overdue Penalty",
+                    "Route Class & Asset Tonnage",
+                    "Operational Capacity (PSR Lifting)",
+                    "Statutory Departmental Compliance"
+                ],
+                "Weight (%)": [30, 25, 20, 15, 10]
+            })
+            fig_factors = px.bar(
+                ai_factors_df,
+                x="Weight (%)",
+                y="Evaluation Factor",
+                orientation="h",
+                text="Weight (%)",
+                color="Weight (%)",
+                color_continuous_scale=resolved_theme["dept_scale"],
+                title="AI Prioritization Model - Feature Weights",
             )
-            severity_data = severity_data.sort_values("Severity")
+            fig_factors.update_layout(coloraxis_showscale=False, yaxis=dict(autorange="reversed"))
+            fig_factors = apply_chart_theme(fig_factors, show_legend=False)
+            st.plotly_chart(fig_factors, use_container_width=True, config={"displaylogo": False})
 
-            fig_severity = px.bar(
-                severity_data,
-                x="Severity",
-                y="Jobs",
-                text="Jobs",
-                title="Defect Severity Analysis",
-                color="Severity",
-                color_discrete_map=resolved_theme["severity_colors"],
-            )
-            fig_severity.update_layout(xaxis=dict(showgrid=False))
-            fig_severity = apply_chart_theme(fig_severity, show_legend=False)
-            st.plotly_chart(fig_severity, use_container_width=True, config={"displaylogo": False})
-
-        st.markdown('<div class="section-head">Shadow Block Efficiency</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-head">Shadow Block Consolidation Efficiency</div>', unsafe_allow_html=True)
 
         if not blocks_df.empty:
-            efficiency_df = blocks_df[["Block ID", "Track", "Bundled Tasks"]].copy()
+            eff_df = blocks_df.head(20).copy()
             fig_blocks = px.bar(
-                efficiency_df,
+                eff_df,
                 x="Block ID",
-                y="Bundled Tasks",
-                color="Bundled Tasks",
-                text="Bundled Tasks",
-                title="Tasks Consolidated per Shadow Block",
-                hover_data=["Track"],
+                y="Downtime Saved (m)",
+                color="Tasks Bundled",
+                text="Downtime Saved (m)",
+                title="Corridor Downtime Saved per Coordinated Shadow Block (Minutes)",
+                hover_data=["Track", "Consolidated Departments"],
                 color_continuous_scale=resolved_theme["dept_scale"],
             )
-            fig_blocks.update_layout(coloraxis_showscale=False, xaxis=dict(showgrid=False))
+            fig_blocks.update_layout(xaxis=dict(showgrid=False))
             fig_blocks = apply_chart_theme(fig_blocks, title_margin=55)
             st.plotly_chart(fig_blocks, use_container_width=True, config={"displaylogo": False})
-        else:
-            st.info("Run the AI scheduler to generate Shadow Blocks.")
 
 
 # ============================================================
@@ -881,9 +986,9 @@ st.markdown("---")
 st.markdown(
     """
 <div style="text-align:center;color:var(--muted);font-size:12px;padding:10px 0 0 0;">
-<b>AI Rail Corridor Scheduler</b> &nbsp;•&nbsp;
-Intelligent Maintenance Planning Engine &nbsp;•&nbsp;
-AI Shadow Block Optimization
+<b>Automatic Block Planning System</b> &nbsp;|&nbsp;
+Integrated TMS (P-Way), SMMS (S&amp;T), TDMS (TRD) &amp; COA Engine &nbsp;|&nbsp;
+Multi-Department AI Shadow Block Optimizer
 </div>
 """,
     unsafe_allow_html=True,

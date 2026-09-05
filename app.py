@@ -1,7 +1,7 @@
 import sqlite3
 import random
 from datetime import datetime, date, timedelta
-
+from  zoneinfo import ZoneInfo
 import pandas as pd
 import plotly.express as px
 import streamlit as st
@@ -417,7 +417,7 @@ st.markdown(
 </div>
 </div>
 <div class="topbar-right">
-<div class="clock-chip">{datetime.now().strftime("%d %b %Y, %H:%M")}</div>
+<div class="clock-chip">{datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%d %b %Y, %H:%M")}</div>
 <div class="system-state">SYSTEM ONLINE</div>
 </div>
 </div>
